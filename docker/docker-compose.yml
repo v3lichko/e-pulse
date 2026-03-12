@@ -1,0 +1,143 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      POSTGRES_DB: ${DB_NAME:-evcharging}
+      POSTGRES_USER: ${DB_USER:-evuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-evpassword}
+    networks:
+      - backend_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-evuser} -d ${DB_NAME:-evcharging}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend_network
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  celery_worker:
+    build:
+      context: ..
+      dockerfile: docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    volumes:
+      - media_volume:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend_network
+    command: celery -A config worker -l info --concurrency 4
+
+  celery_beat:
+    build:
+      context: ..
+      dockerfile: docker/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend_network
+    command: celery -A config beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+
+  ocpp:
+    build:
+      context: ..
+      dockerfile: docker/ocpp/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    ports:
+      - "9000:9000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend_network
+
+  nginx:
+    build:
+      context: ..
+      dockerfile: docker/nginx/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - static_volume:/app/staticfiles:ro
+      - media_volume:/app/media:ro
+    depends_on:
+      - backend
+    networks:
+      - backend_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+
+networks:
+  backend_network:
+    driver: bridge
